@@ -8,10 +8,17 @@ use console::style;
 use dashmap::DashMap;
 use inquire::Select;
 use place::{
-    format_places_human, resolve_place, snapshot_state_places, PlaceInfo, PlaceMatchError,
+    format_places_human, immediate_place_match, resolve_place, snapshot_state_places, PlaceInfo,
+    PlaceMatchError,
 };
 use state::AppState;
-use std::{net::SocketAddr, process::exit, sync::Arc, time::Duration};
+use std::{
+    io::{stdin, IsTerminal},
+    net::SocketAddr,
+    process::exit,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     fs::read_to_string,
     spawn,
@@ -34,7 +41,8 @@ const EXIT_SELECTION: i32 = 2;
     after_help = "Exit codes:\n  \
         0  Success (--list found places, or tests passed)\n  \
         1  Tests ran and one or more failed\n  \
-        2  No places checked in, --list was empty, or --place did not uniquely match"
+        2  No places checked in, --list was empty, --place did not uniquely match,\n     \
+           or interactive selection failed (non-TTY / prompt error)"
 )]
 struct Cli {
     /// Only print failing tests (existing behavior)
@@ -80,7 +88,16 @@ async fn main() {
 
     let state_clone = Arc::clone(&state);
     spawn(async move {
-        run_place_flow(state_clone, cli).await;
+        run_place_flow(Arc::clone(&state_clone), cli).await;
+        // Successful --place / interactive selection returns so /poll can run tests.
+        // Any other return would leave axum listening on :28859.
+        if state_clone.active_place.lock().await.is_none() {
+            eprintln!(
+                "{}",
+                style("Place selection ended without activating a place.").red()
+            );
+            exit(EXIT_SELECTION);
+        }
     });
 
     let app = Router::new()
@@ -143,23 +160,54 @@ async fn wait_and_select_place(state: Arc<AppState>, timeout: Duration, query: &
 
     loop {
         let places = snapshot_state_places(&state);
-        match resolve_place(&places, query) {
-            Ok(place) => {
-                activate_place(&state, place).await;
-                return;
-            }
-            Err(PlaceMatchError::Ambiguous(matches)) => {
-                print_place_match_error(query, PlaceMatchError::Ambiguous(matches), &places, json);
-                exit(EXIT_SELECTION);
-            }
-            Err(PlaceMatchError::NotFound) => {
-                if start_time.elapsed() >= timeout {
-                    print_place_match_error(query, PlaceMatchError::NotFound, &places, json);
+        let timed_out = start_time.elapsed() >= timeout;
+
+        if let Some(result) = immediate_place_match(&places, query) {
+            match result {
+                Ok(place) => {
+                    activate_place(&state, place).await;
+                    return;
+                }
+                Err(error) => {
+                    print_place_match_error(query, error, &places, json);
                     exit(EXIT_SELECTION);
                 }
-                sleep(Duration::from_millis(100)).await;
             }
         }
+
+        if timed_out {
+            // Name matches (and anything that is not a stable GUID/id) resolve once.
+            match resolve_place(&places, query) {
+                Ok(place) => {
+                    activate_place(&state, place).await;
+                    return;
+                }
+                Err(error) => {
+                    print_place_match_error(query, error, &places, json);
+                    exit(EXIT_SELECTION);
+                }
+            }
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// How the default (no `--place`) path should treat the current place set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractiveChoice {
+    WaitForMore,
+    AutoSelect,
+    Prompt,
+    ExitNonTty,
+}
+
+fn decide_interactive_selection(place_count: usize, stdin_is_tty: bool) -> InteractiveChoice {
+    match place_count {
+        0 => InteractiveChoice::WaitForMore,
+        1 => InteractiveChoice::AutoSelect,
+        _ if stdin_is_tty => InteractiveChoice::Prompt,
+        _ => InteractiveChoice::ExitNonTty,
     }
 }
 
@@ -178,11 +226,18 @@ async fn wait_and_select_interactive(state: Arc<AppState>, timeout: Duration) {
             exit(EXIT_SELECTION);
         }
 
-        let key: Option<String> = match state.places.len() {
-            0 => None,
-            1 => Some(state.places.iter().next().unwrap().key().to_string()),
-            _ => Some(inquire_place(Arc::clone(&state))),
-        };
+        let stdin_is_tty = stdin().is_terminal();
+        let key: Option<String> =
+            match decide_interactive_selection(state.places.len(), stdin_is_tty) {
+                InteractiveChoice::WaitForMore => None,
+                InteractiveChoice::AutoSelect => {
+                    Some(state.places.iter().next().unwrap().key().to_string())
+                }
+                InteractiveChoice::Prompt => Some(inquire_place(Arc::clone(&state))),
+                InteractiveChoice::ExitNonTty => {
+                    exit_non_tty_multi_place(&snapshot_state_places(&state));
+                }
+            };
 
         match key {
             Some(key) => {
@@ -253,12 +308,7 @@ fn print_place_match_error(
         }
     }
 
-    if !all_places.is_empty() {
-        eprintln!("{}", style("Connected places:").dim());
-        for line in format_places_human(all_places).lines() {
-            eprintln!("  {line}");
-        }
-    }
+    eprint_connected_places(all_places);
 
     if json {
         println!(
@@ -268,23 +318,57 @@ fn print_place_match_error(
     }
 }
 
+fn eprint_connected_places(places: &[PlaceInfo]) {
+    if places.is_empty() {
+        return;
+    }
+    eprintln!("{}", style("Connected places:").dim());
+    for line in format_places_human(places).lines() {
+        eprintln!("  {line}");
+    }
+}
+
+fn pass_place_flag_hint() -> String {
+    "Pass --place <guid|name|id> to select a place without a prompt.".to_string()
+}
+
+fn exit_non_tty_multi_place(places: &[PlaceInfo]) -> ! {
+    eprintln!(
+        "{}",
+        style("stdin is not a TTY; cannot prompt to choose among multiple places.").red()
+    );
+    eprint_connected_places(places);
+    eprintln!("{}", style(pass_place_flag_hint()).dim());
+    exit(EXIT_SELECTION);
+}
+
+fn exit_prompt_failure(error: impl std::fmt::Display, places: &[PlaceInfo]) -> ! {
+    eprintln!(
+        "{}",
+        style(format!("Failed to prompt for place selection: {error}")).red()
+    );
+    eprint_connected_places(places);
+    eprintln!("{}", style(pass_place_flag_hint()).dim());
+    exit(EXIT_SELECTION);
+}
+
 fn inquire_place(state: Arc<AppState>) -> String {
-    let options: Vec<String> = state
-        .places
+    let places = snapshot_state_places(&state);
+    // Defense in depth: skip inquire entirely when stdin is not a TTY so
+    // a NotTTY prompt error cannot unwind the selection task while axum lives.
+    if !stdin().is_terminal() {
+        exit_non_tty_multi_place(&places);
+    }
+
+    let options: Vec<String> = places
         .iter()
-        .map(|place| {
-            format!(
-                "{} ({}) [{}]",
-                place.value().name,
-                place.value().id,
-                place.key()
-            )
-        })
+        .map(|place| format!("{} ({}) [{}]", place.name, place.id, place.guid))
         .collect();
 
-    let selected = Select::new("Select a place to run tests on:", options)
-        .prompt()
-        .expect("Failed to prompt user for place selection");
+    let selected = match Select::new("Select a place to run tests on:", options).prompt() {
+        Ok(selected) => selected,
+        Err(error) => exit_prompt_failure(error, &places),
+    };
 
     let key = selected
         .split_whitespace()
@@ -338,5 +422,133 @@ mod tests {
         let cli = Cli::try_parse_from(["testez-companion-cli", "--place", "Lobby"]).unwrap();
         assert_eq!(cli.place.as_deref(), Some("Lobby"));
         assert!(!cli.list);
+    }
+
+    #[test]
+    fn non_tty_with_multiple_places_exits_without_prompt() {
+        assert_eq!(
+            decide_interactive_selection(2, false),
+            InteractiveChoice::ExitNonTty
+        );
+        assert_eq!(
+            decide_interactive_selection(3, false),
+            InteractiveChoice::ExitNonTty
+        );
+    }
+
+    #[test]
+    fn tty_with_multiple_places_prompts() {
+        assert_eq!(
+            decide_interactive_selection(2, true),
+            InteractiveChoice::Prompt
+        );
+    }
+
+    #[test]
+    fn single_place_auto_selects_without_tty() {
+        assert_eq!(
+            decide_interactive_selection(1, false),
+            InteractiveChoice::AutoSelect
+        );
+        assert_eq!(
+            decide_interactive_selection(1, true),
+            InteractiveChoice::AutoSelect
+        );
+    }
+
+    #[test]
+    fn zero_places_keeps_waiting() {
+        assert_eq!(
+            decide_interactive_selection(0, false),
+            InteractiveChoice::WaitForMore
+        );
+        assert_eq!(
+            decide_interactive_selection(0, true),
+            InteractiveChoice::WaitForMore
+        );
+    }
+
+    #[test]
+    fn non_tty_hint_mentions_place_flag() {
+        assert!(pass_place_flag_hint().contains("--place"));
+    }
+
+    fn test_state() -> Arc<AppState> {
+        Arc::new(AppState {
+            config: Arc::new(Config {
+                roots: vec![],
+                test_extra_options: None,
+            }),
+            places: DashMap::new(),
+            active_place: Mutex::new(None),
+            only_log_failures: false,
+            json: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn name_query_waits_full_timeout_before_activating() {
+        let state = test_state();
+        state.places.insert(
+            "guid-a".to_string(),
+            state::Place {
+                name: "Lobby".to_string(),
+                id: 1,
+            },
+        );
+
+        let timeout = Duration::from_millis(300);
+        let start = Instant::now();
+        wait_and_select_place(Arc::clone(&state), timeout, "Lobby", false).await;
+        assert!(
+            start.elapsed() >= timeout,
+            "name matches must wait the full timeout, elapsed {:?}",
+            start.elapsed()
+        );
+        assert_eq!(state.active_place.lock().await.as_deref(), Some("guid-a"));
+    }
+
+    #[tokio::test]
+    async fn guid_query_activates_before_timeout() {
+        let state = test_state();
+        state.places.insert(
+            "guid-a".to_string(),
+            state::Place {
+                name: "Lobby".to_string(),
+                id: 1,
+            },
+        );
+
+        let timeout = Duration::from_secs(5);
+        let start = Instant::now();
+        wait_and_select_place(Arc::clone(&state), timeout, "guid-a", false).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "exact GUID should early-select, elapsed {:?}",
+            start.elapsed()
+        );
+        assert_eq!(state.active_place.lock().await.as_deref(), Some("guid-a"));
+    }
+
+    #[tokio::test]
+    async fn unique_id_activates_before_timeout() {
+        let state = test_state();
+        state.places.insert(
+            "guid-a".to_string(),
+            state::Place {
+                name: "Lobby".to_string(),
+                id: 42,
+            },
+        );
+
+        let timeout = Duration::from_secs(5);
+        let start = Instant::now();
+        wait_and_select_place(Arc::clone(&state), timeout, "42", false).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "unique numeric id should early-select, elapsed {:?}",
+            start.elapsed()
+        );
+        assert_eq!(state.active_place.lock().await.as_deref(), Some("guid-a"));
     }
 }
