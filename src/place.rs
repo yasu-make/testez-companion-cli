@@ -43,6 +43,33 @@ pub fn format_places_human(places: &[PlaceInfo]) -> String {
         .join("\n")
 }
 
+/// A `--place` match that cannot change if more places check in later.
+///
+/// Exact GUID and unique numeric place id are stable. Name matches are not:
+/// another Studio instance with the same place name may still check in.
+///
+/// `None` means keep waiting (name query, or GUID/id not present yet).
+pub fn immediate_place_match<'a>(
+    places: &'a [PlaceInfo],
+    query: &str,
+) -> Option<Result<&'a PlaceInfo, PlaceMatchError>> {
+    if let Some(place) = places.iter().find(|place| place.guid == query) {
+        return Some(Ok(place));
+    }
+
+    let id_matches: Vec<&PlaceInfo> = places
+        .iter()
+        .filter(|place| place.id.to_string() == query)
+        .collect();
+    match id_matches.as_slice() {
+        [place] => Some(Ok(place)),
+        [] => None,
+        _ => Some(Err(PlaceMatchError::Ambiguous(
+            id_matches.into_iter().cloned().collect(),
+        ))),
+    }
+}
+
 /// Resolve `--place` against connected places.
 ///
 /// Matching order:
@@ -52,6 +79,7 @@ pub fn format_places_human(places: &[PlaceInfo]) -> String {
 /// 4. Unique place name, ASCII case-insensitive
 ///
 /// Zero or multiple matches after a step that produced candidates is an error.
+/// Name matches should only be applied after the full `--timeout` wait.
 pub fn resolve_place<'a>(
     places: &'a [PlaceInfo],
     query: &str,
@@ -172,6 +200,82 @@ mod tests {
     #[test]
     fn empty_list_is_not_found() {
         assert_eq!(resolve_place(&[], "x"), Err(PlaceMatchError::NotFound));
+    }
+
+    #[test]
+    fn name_match_is_not_immediate_even_when_unique() {
+        let places = vec![place("guid-a", "Lobby", 1)];
+        assert_eq!(immediate_place_match(&places, "Lobby"), None);
+        assert_eq!(immediate_place_match(&places, "lobby"), None);
+    }
+
+    #[test]
+    fn numeric_looking_name_is_not_immediate_without_id() {
+        let places = vec![place("guid-a", "123", 999)];
+        assert_eq!(immediate_place_match(&places, "123"), None);
+    }
+
+    #[test]
+    fn guid_is_immediate() {
+        let places = vec![place("guid-a", "Lobby", 1), place("guid-b", "Arena", 2)];
+        let matched = immediate_place_match(&places, "guid-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(matched.guid, "guid-a");
+    }
+
+    #[test]
+    fn unique_id_is_immediate() {
+        let places = vec![place("guid-a", "Lobby", 123)];
+        let matched = immediate_place_match(&places, "123").unwrap().unwrap();
+        assert_eq!(matched.guid, "guid-a");
+    }
+
+    #[test]
+    fn missing_guid_or_id_keeps_waiting() {
+        assert_eq!(immediate_place_match(&[], "guid-a"), None);
+        let places = vec![place("guid-a", "Lobby", 1)];
+        assert_eq!(immediate_place_match(&places, "guid-missing"), None);
+        assert_eq!(immediate_place_match(&places, "99"), None);
+    }
+
+    #[test]
+    fn ambiguous_ids_are_immediate_error() {
+        let places = vec![place("guid-a", "A", 5), place("guid-b", "B", 5)];
+        let err = immediate_place_match(&places, "5").unwrap().unwrap_err();
+        assert!(matches!(err, PlaceMatchError::Ambiguous(list) if list.len() == 2));
+    }
+
+    #[test]
+    fn name_resolution_waits_then_sees_duplicate() {
+        // First check-in would uniquely match; do not select yet.
+        let first = vec![place("guid-a", "Lobby", 1)];
+        assert_eq!(immediate_place_match(&first, "Lobby"), None);
+
+        // After the full timeout, a second same-name place is also present.
+        let after_wait = vec![place("guid-a", "Lobby", 1), place("guid-b", "Lobby", 2)];
+        let err = resolve_place(&after_wait, "Lobby").unwrap_err();
+        assert!(matches!(err, PlaceMatchError::Ambiguous(list) if list.len() == 2));
+    }
+
+    #[test]
+    fn name_resolution_waits_then_unique_activates() {
+        let first = vec![place("guid-a", "Lobby", 1)];
+        assert_eq!(immediate_place_match(&first, "Lobby"), None);
+
+        let after_wait = vec![place("guid-a", "Lobby", 1), place("guid-b", "Arena", 2)];
+        let matched = resolve_place(&after_wait, "Lobby").unwrap();
+        assert_eq!(matched.guid, "guid-a");
+    }
+
+    #[test]
+    fn name_resolution_waits_then_not_found() {
+        let first = vec![place("guid-a", "Arena", 1)];
+        assert_eq!(immediate_place_match(&first, "Lobby"), None);
+        assert_eq!(
+            resolve_place(&first, "Lobby"),
+            Err(PlaceMatchError::NotFound)
+        );
     }
 
     #[test]
