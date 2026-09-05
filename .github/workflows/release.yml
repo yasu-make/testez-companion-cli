@@ -37,10 +37,20 @@ permissions:
 #
 # If there's a prerelease-style suffix to the version, then the release(s)
 # will be marked as a prerelease.
+#
+# workflow_dispatch rebuilds and publishes an existing tag (for example when a
+# GitHub App / ghs_ token pushed the tag and the push webhook never fired).
+# That path does not delete or recreate the tag.
 on:
   push:
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing git tag to build and publish (example: v0.1.5)'
+        required: true
+        type: string
 
 jobs:
   # Run 'cargo dist plan' (or host) to determine what tasks we need to do
@@ -48,15 +58,16 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
-      tag: ${{ !github.event.pull_request && github.ref_name || '' }}
-      tag-flag: ${{ !github.event.pull_request && format('--tag={0}', github.ref_name) || '' }}
-      publishing: ${{ !github.event.pull_request }}
+      tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || (!github.event.pull_request && github.ref_name || '') }}
+      tag-flag: ${{ github.event_name == 'workflow_dispatch' && format('--tag={0}', inputs.tag) || (!github.event.pull_request && format('--tag={0}', github.ref_name) || '') }}
+      publishing: ${{ github.event_name == 'workflow_dispatch' || !github.event.pull_request }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
       - name: Install cargo-dist
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0
@@ -69,7 +80,7 @@ jobs:
       # but also really annoying to build CI around when it needs secrets to work right.)
       - id: plan
         run: |
-          cargo dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
+          cargo dist ${{ github.event_name == 'workflow_dispatch' && format('host --steps=create --tag={0}', inputs.tag) || (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name) || 'plan') }} --output-format=json > plan-dist-manifest.json
           echo "cargo dist ran successfully"
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -107,6 +118,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          ref: ${{ needs.plan.outputs.tag || github.ref }}
       - uses: swatinem/rust-cache@v2
         with:
           key: ${{ join(matrix.targets, '-') }}
@@ -161,6 +173,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          ref: ${{ needs.plan.outputs.tag || github.ref }}
       - name: Install cargo-dist
         shell: bash
         run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.13.2/cargo-dist-installer.sh | sh"
@@ -207,6 +220,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          ref: ${{ needs.plan.outputs.tag || github.ref }}
       - name: Install cargo-dist
         run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.13.2/cargo-dist-installer.sh | sh"
       # Fetch artifacts from scratch-storage
@@ -247,6 +261,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          ref: ${{ needs.plan.outputs.tag || github.ref }}
       - name: "Download GitHub Artifacts"
         uses: actions/download-artifact@v4
         with:
@@ -265,3 +280,6 @@ jobs:
           body: ${{ fromJson(needs.host.outputs.val).announcement_github_body }}
           prerelease: ${{ fromJson(needs.host.outputs.val).announcement_is_prerelease }}
           artifacts: "artifacts/*"
+          # Tag is left in place; update a draft/partial release if one exists.
+          allowUpdates: true
+          replacesArtifacts: true
