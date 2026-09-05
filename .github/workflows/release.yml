@@ -68,6 +68,38 @@ jobs:
         with:
           submodules: recursive
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      # Older tags such as v0.1.5 still ship cargo-dist 0.13.2 defaults
+      # (macos-12 / windows-2019 / ubuntu-20.04). Overlay current runners
+      # here (not a repo script) so a tag checkout still plans a runnable matrix.
+      - name: Use currently available GitHub-hosted runners
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          path = Path("Cargo.toml")
+          text = path.read_text()
+          block = "\n".join(
+              [
+                  "[workspace.metadata.dist.github-custom-runners]",
+                  'x86_64-unknown-linux-gnu = "ubuntu-22.04"',
+                  'aarch64-apple-darwin = "macos-14"',
+                  'x86_64-apple-darwin = "macos-15-intel"',
+                  'x86_64-pc-windows-msvc = "windows-2022"',
+                  "",
+              ]
+          )
+          pattern = r"\[workspace\.metadata\.dist\.github-custom-runners\][^\[]*"
+          if re.search(pattern, text):
+              text = re.sub(pattern, block, text, count=1)
+          else:
+              text = text.rstrip() + "\n\n" + block
+          if not text.endswith("\n"):
+              text += "\n"
+          path.write_text(text)
+          print("applied github-custom-runners overlay")
+          PY
       - name: Install cargo-dist
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0
@@ -165,7 +197,7 @@ jobs:
     needs:
       - plan
       - build-local-artifacts
-    runs-on: "ubuntu-20.04"
+    runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
@@ -213,7 +245,7 @@ jobs:
     if: ${{ always() && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    runs-on: "ubuntu-20.04"
+    runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     steps:
@@ -254,7 +286,7 @@ jobs:
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
     if: ${{ always() && needs.host.result == 'success' }}
-    runs-on: "ubuntu-20.04"
+    runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
