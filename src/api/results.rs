@@ -4,9 +4,35 @@ use crate::{
 };
 use axum::{extract::State, http::StatusCode, Json};
 use console::style;
+use serde::Serialize;
 use serde_json::Value;
 use std::{fmt::Write, process::exit, sync::Arc, time::Duration};
 use tokio::{spawn, time::sleep};
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TestSummary {
+    success: bool,
+    success_count: u32,
+    failure_count: u32,
+    skipped_count: u32,
+}
+
+fn emit_line(json: bool, line: impl AsRef<str>) {
+    if json {
+        eprintln!("{}", line.as_ref());
+    } else {
+        println!("{}", line.as_ref());
+    }
+}
+
+fn emit(json: bool, text: impl AsRef<str>) {
+    if json {
+        eprint!("{}", text.as_ref());
+    } else {
+        print!("{}", text.as_ref());
+    }
+}
 
 fn print_children(state: &Arc<AppState>, children: Vec<ReporterChildNode>, indent: u32) -> bool {
     let mut success = true;
@@ -24,7 +50,10 @@ fn print_children(state: &Arc<AppState>, children: Vec<ReporterChildNode>, inden
             }
             ReporterStatus::Skipped => style(format!("↪ {}", child.plan_node.phrase)).blue(),
         };
-        println!("{}{}", " ".repeat(indent as usize), styled_phrase);
+        emit_line(
+            state.json,
+            format!("{}{}", " ".repeat(indent as usize), styled_phrase),
+        );
 
         for error in child.errors {
             let indented_error: String = error.split('\n').fold(String::new(), |mut acc, line| {
@@ -38,7 +67,7 @@ fn print_children(state: &Arc<AppState>, children: Vec<ReporterChildNode>, inden
                 .unwrap();
                 acc
             });
-            print!("{}", indented_error);
+            emit(state.json, indented_error);
         }
 
         if !print_children(state, child.children, indent + 2) {
@@ -54,11 +83,32 @@ pub async fn results(State(state): State<Arc<AppState>>, Json(body): Json<Value>
 
     let success = print_children(&state, output.children, 0);
 
-    println!();
+    emit_line(state.json, "");
+    emit_line(
+        state.json,
+        format!("{} {}", style("✓ Success:").green(), output.success_count),
+    );
+    emit_line(
+        state.json,
+        format!("{} {}", style("X Failure:").red(), output.failure_count),
+    );
+    emit_line(
+        state.json,
+        format!("{} {}", style("↪ Skip:").blue(), output.skipped_count),
+    );
 
-    println!("{} {}", style("✓ Success:").green(), output.success_count);
-    println!("{} {}", style("X Failure:").red(), output.failure_count);
-    println!("{} {}", style("↪ Skip:").blue(), output.skipped_count);
+    if state.json {
+        let summary = TestSummary {
+            success,
+            success_count: output.success_count,
+            failure_count: output.failure_count,
+            skipped_count: output.skipped_count,
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&summary).expect("Failed to serialize test summary")
+        );
+    }
 
     // This is mildly cursed - we need to return a status code, but we also need
     // to exit the progam so that we don't keep receiving results.
