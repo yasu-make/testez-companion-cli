@@ -4,6 +4,7 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 
+#[derive(Clone)]
 pub struct Place {
     pub name: String,
     pub id: u64,
@@ -16,4 +17,5 @@ pub struct AppState {
     pub active_place: Mutex<Option<String>>,
 
     pub only_log_failures: bool,
+    pub json: bool,
 }

@@ -1,8 +1,10 @@
-use axum::{http::StatusCode, Json};
+use crate::state::AppState;
+use axum::{extract::State, http::StatusCode, Json};
 use console::style;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_repr::{Deserialize_repr, Serialize_repr};
+use std::sync::Arc;
 
 #[derive(Serialize_repr, Deserialize_repr, Debug)]
 #[repr(u8)]
@@ -20,18 +22,29 @@ struct Log {
     message_type: MessageType,
 }
 
-pub async fn logs(Json(body): Json<Value>) -> StatusCode {
+fn emit_line(json: bool, line: impl AsRef<str>) {
+    if json {
+        eprintln!("{}", line.as_ref());
+    } else {
+        println!("{}", line.as_ref());
+    }
+}
+
+pub async fn logs(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> StatusCode {
     let log: Log = serde_json::from_value(body).unwrap();
 
     match log.message_type {
         MessageType::Output | MessageType::Info => {
-            println!("Output: {}", log.message);
+            emit_line(state.json, format!("Output: {}", log.message));
         }
         MessageType::Warning => {
-            println!("Warning: {}", style(log.message).yellow());
+            emit_line(
+                state.json,
+                format!("Warning: {}", style(log.message).yellow()),
+            );
         }
         MessageType::Error => {
-            println!("Error: {}", style(log.message).red());
+            emit_line(state.json, format!("Error: {}", style(log.message).red()));
         }
     }
 
