@@ -30,8 +30,10 @@ lto = "thin"
 # Config for 'cargo dist'
 [workspace.metadata.dist]
 # The preferred cargo-dist version to use in CI (Cargo.toml SemVer syntax)
+# Keep 0.13.2 so `gh workflow run "Release" -f tag=v0.1.5` still plans
+# against the tagged Cargo.toml (0.32+ refuses a version mismatch).
 cargo-dist-version = "0.13.2"
-# release.yml is hand-edited for workflow_dispatch; skip the generated-CI check
+# release.yml is hand-edited for workflow_dispatch + current runners
 allow-dirty = ["ci"]
 # CI backends to support
 ci = ["github"]
@@ -49,3 +51,13 @@ pr-run-mode = "skip"
 windows-archive = ".zip"
 unix-archive = ".zip"
 checksum = "false"
+
+# cargo-dist 0.13.2 defaults to removed GitHub-hosted images
+# (macos-12, windows-2019, ubuntu-20.04). Override to current ones.
+# macos-15-intel is the hosted Intel replacement for macos-12 so
+# x86_64-apple-darwin stays a native build under 0.13.2.
+[workspace.metadata.dist.github-custom-runners]
+x86_64-unknown-linux-gnu = "ubuntu-22.04"
+aarch64-apple-darwin = "macos-14"
+x86_64-apple-darwin = "macos-15-intel"
+x86_64-pc-windows-msvc = "windows-2022"
